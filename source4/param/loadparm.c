@@ -69,6 +69,10 @@
 #include "lib/socket/socket.h"
 #include "auth/gensec/gensec.h"
 
+#ifdef HAVE_GLOB_H
+#include <glob.h>
+#endif
+
 #define standard_sub_basic talloc_strdup
 
 static bool do_parameter(const char *, const char *, void *);
@@ -1484,17 +1488,72 @@ static bool handle_include(struct loadparm_context *lp_ctx,
 			   const char *pszParmValue, char **ptr)
 {
 	char *fname = standard_sub_basic(lp_ctx, pszParmValue);
+#ifdef HAVE_GLOB_H
+	glob_t globbuf;
+	int i;
+#endif
 
+#ifndef HAVE_GLOB_H
 	add_to_file_list(lp_ctx, pszParmValue, fname);
+#else
+	switch (glob(fname, 0, NULL, &globbuf))
+	{
+		case 0:
+			break;
+		case GLOB_NOMATCH:
+			DEBUG(2, ("Can't find include file %s\n", fname));
+			globfree(&globbuf);
+			return true;
+		case GLOB_ABORTED:
+			DEBUG(2, ("Read error while looking for %s\n", fname));
+			globfree(&globbuf);
+			return false;
+		case GLOB_NOSPACE:
+			DEBUG(2, ("Out of memory while looking for %s\n", fname));
+			globfree(&globbuf);
+			return false;
+		default:
+			DEBUG(2, ("Unexpected error while looking for %s\n", fname));
+			globfree(&globbuf);
+			return false;
+	}
 
+	/* The output data will be the pattern which was searched. */
+#endif
 	string_set(lp_ctx, ptr, fname);
 
+#ifndef HAVE_GLOB_H
 	if (file_exist(fname))
 		return pm_process(fname, do_section, do_parameter, lp_ctx);
 
 	DEBUG(2, ("Can't find include file %s\n", fname));
 
 	return false;
+#else
+	for (i = 0; globbuf.gl_pathv[i] != NULL; ++i)
+	{
+		add_to_file_list(lp_ctx, pszParmValue, globbuf.gl_pathv[i]);
+
+		/* Check again if the file exists, even though it's from a glob -
+		 * we might have been seeing broken links. */
+		if (!file_exist(globbuf.gl_pathv[i])) {
+			DEBUG(2, ("Can't find include file %s\n", globbuf.gl_pathv[i]));
+			globfree(&globbuf);
+			return false;
+		}
+
+		if (!pm_process(globbuf.gl_pathv[i], do_section, do_parameter, lp_ctx))
+		{
+			globfree(&globbuf);
+			return false;
+		}
+
+		/* Otherwise, continue to the next file. */
+	}
+
+	globfree(&globbuf);
+	return true;
+#endif
 }
 
 /***************************************************************************
