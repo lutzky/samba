@@ -7238,6 +7238,10 @@ static bool bAllowIncludeRegistry = true;
 static bool handle_include(int snum, const char *pszParmValue, char **ptr)
 {
 	char *fname;
+#ifdef HAVE_GLOB_H
+	glob_t globbuf;
+	int i;
+#endif
 
 	if (include_depth >= MAX_INCLUDE_DEPTH) {
 		DEBUG(0, ("Error: Maximum include depth (%u) exceeded!\n",
@@ -7266,20 +7270,77 @@ static bool handle_include(int snum, const char *pszParmValue, char **ptr)
 				 current_user_info.domain,
 				 pszParmValue);
 
+#ifndef HAVE_GLOB_H
 	add_to_file_list(pszParmValue, fname);
+#else
+	switch (glob(fname, 0, NULL, &globbuf))
+	{
+		case 0:
+			break;
+		case GLOB_NOMATCH:
+			DEBUG(2, ("Can't find include file %s\n", fname));
+			globfree(&globbuf);
+			SAFE_FREE(fname);
+			return true;
+		case GLOB_ABORTED:
+			DEBUG(2, ("Read error while looking for %s\n", fname));
+			globfree(&globbuf);
+			SAFE_FREE(fname);
+			return false;
+		case GLOB_NOSPACE:
+			DEBUG(2, ("Out of memory while looking for %s\n", fname));
+			globfree(&globbuf);
+			SAFE_FREE(fname);
+			return false;
+		default:
+			DEBUG(2, ("Unexpected error while looking for %s\n", fname));
+			globfree(&globbuf);
+			SAFE_FREE(fname);
+			return false;
+	}
 
+	/* The output data will be the pattern which was searched. */
+#endif
 	string_set(ptr, fname);
 
+#ifndef HAVE_GLOB_H
 	if (file_exist(fname)) {
-		bool ret;
-		include_depth++;
-		ret = pm_process(fname, do_section, do_parameter, NULL);
-		include_depth--;
-		TALLOC_FREE(fname);
+		bool ret = pm_process(fname, do_section, do_parameter, NULL);
+		SAFE_FREE(fname);
 		return ret;
 	}
 
 	DEBUG(2, ("Can't find include file %s\n", fname));
+#else
+	for (i = 0; globbuf.gl_pathv[i] != NULL; ++i)
+	{
+		bool ret;
+		add_to_file_list(pszParmValue, globbuf.gl_pathv[i]);
+
+		/* Check again if the file exists, even though it's from a glob -
+		 * we might have been seeing broken links. */
+		if (!file_exist(globbuf.gl_pathv[i])) {
+			DEBUG(2, ("Can't find include file %s\n", globbuf.gl_pathv[i]));
+			globfree(&globbuf);
+			SAFE_FREE(fname);
+			return true;
+		}
+
+		include_depth++;
+		ret = pm_process(fname, do_section, do_parameter, NULL);
+		include_depth--;
+		if (!ret) {
+			globfree(&globbuf);
+			TALLOC_FREE(fname);
+			return false;
+		}
+
+		/* Otherwise, continue to the next file. */
+	}
+
+	globfree(&globbuf);
+#endif
+
 	TALLOC_FREE(fname);
 	return true;
 }
